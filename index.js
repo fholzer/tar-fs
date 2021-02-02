@@ -34,7 +34,6 @@ var statAll = function (fs, stat, cwd, ignore, entries, sort) {
       fs.readdir(nextAbs, function (err, files) {
         if (err) return callback(err)
 
-        if (sort) files.sort()
         for (var i = 0; i < files.length; i++) {
           if (!ignore(path.join(cwd, next, files[i]))) queue.push(path.join(next, files[i]))
         }
@@ -73,6 +72,7 @@ exports.pack = function (cwd, opts) {
   var fmode = typeof opts.fmode === 'number' ? opts.fmode : 0
   var pack = opts.pack || tar.pack()
   var finish = opts.finish || noop
+  var queue = []
 
   if (opts.strip) map = strip(map, opts.strip)
 
@@ -85,25 +85,50 @@ exports.pack = function (cwd, opts) {
     fmode |= parseInt(222, 8)
   }
 
-  var onsymlink = function (filename, header) {
-    xfs.readlink(path.join(cwd, filename), function (err, linkname) {
-      if (err) return pack.destroy(err)
-      header.linkname = normalize(linkname)
-      pack.entry(header, onnextentry)
-    })
+  var pushQueueItem = function (header) {
+    queue.push(header)
+  }
+
+  var processQueueItem = function () {
+    const header = queue.shift()
+    if (!header) {
+      return finalizeProcessing()
+    }
+    switch (header.type) {
+      case 'directory':
+      case 'symlink':
+        return pack.entry(header, processQueueItem)
+
+      case 'file':
+        var entry = pack.entry(header, processQueueItem)
+        if (!entry) return
+
+        var rs = mapStream(xfs.createReadStream(path.join(cwd, header.actualPath), { start: 0, end: header.size > 0 ? header.size - 1 : header.size }), header)
+
+        rs.on('error', function (err) { // always forward errors on destroy
+          entry.destroy(err)
+        })
+
+        pump(rs, entry)
+
+      // error handling for unexpected case. How to trigger error on pack?
+    }
   }
 
   var onstat = function (err, filename, stat) {
     if (err) return pack.destroy(err)
     if (!filename) {
-      if (opts.finalize !== false) pack.finalize()
-      return finish(pack)
+      return triggerProcessing()
     }
 
     if (stat.isSocket()) return onnextentry() // tar does not support sockets...
 
+    var normalizedName = normalize(filename)
     var header = {
-      name: normalize(filename),
+      name: normalizedName,
+      // copy of name, so sort cb can modify `name`, while we'll be using
+      // `actualPath` for creating the fs.createReadStream
+      actualPath: normalizedName,
       mode: (stat.mode | (stat.isDirectory() ? dmode : fmode)) & umask,
       mtime: stat.mtime,
       size: stat.size,
@@ -116,14 +141,20 @@ exports.pack = function (cwd, opts) {
       header.size = 0
       header.type = 'directory'
       header = map(header) || header
-      return pack.entry(header, onnextentry)
+      pushQueueItem(header)
+      return onnextentry()
     }
 
     if (stat.isSymbolicLink()) {
       header.size = 0
       header.type = 'symlink'
       header = map(header) || header
-      return onsymlink(filename, header)
+      return xfs.readlink(path.join(cwd, filename), function (err, linkname) {
+        if (err) return pack.destroy(err)
+        header.linkname = normalize(linkname)
+        pushQueueItem(header)
+        return onnextentry()
+      })
     }
 
     // TODO: add fifo etc...
@@ -135,16 +166,24 @@ exports.pack = function (cwd, opts) {
       return onnextentry()
     }
 
-    var entry = pack.entry(header, onnextentry)
-    if (!entry) return
+    pushQueueItem(header)
+    return onnextentry()
+  }
 
-    var rs = mapStream(xfs.createReadStream(path.join(cwd, filename), { start: 0, end: header.size > 0 ? header.size - 1 : header.size }), header)
+  var triggerProcessing = function () {
+    const sort = opts.sort
 
-    rs.on('error', function (err) { // always forward errors on destroy
-      entry.destroy(err)
-    })
+    if (sort) {
+      if (typeof sort === 'function') queue.sort(sort)
+      else queue.sort((a, b) => a.name.localeCompare(b.name))
+    }
 
-    pump(rs, entry)
+    processQueueItem()
+  }
+
+  var finalizeProcessing = function () {
+    if (opts.finalize !== false) pack.finalize()
+    return finish(pack)
   }
 
   var onnextentry = function (err) {
